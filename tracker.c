@@ -1,3 +1,5 @@
+/* Expose POSIX declarations such as getaddrinfo() before including headers. */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -5,8 +7,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include "worker.h"
 
-int ReadConfig(long *port, char directory[10])
+/* port and directory are outputs. The caller supplies room for 10 characters. */
+static int ReadConfig(long *port, char directory[10])
 {
     /* read sconfig */ 
     FILE *config = fopen("sconfig", "r");
@@ -17,7 +21,9 @@ int ReadConfig(long *port, char directory[10])
 
     char extra;
 
-    /* validate sconfig format */
+    /* %ld fills the caller's long. %9s leaves one byte for the string's '\0'.
+       The space before %c skips whitespace, so a third assignment means
+       there was extra content after the two expected fields. */
     int fields = fscanf(config, "%ld %9s %c", port, directory, &extra);
     fclose(config);
 
@@ -26,6 +32,7 @@ int ReadConfig(long *port, char directory[10])
         return -1;
     }
 
+    /* *port reads the value that fscanf() wrote through the pointer. */
     if (*port < 1 || *port > 65535) {
         fprintf(stderr, "The port must be a number from 1 to 65535.\n");
         return -1;
@@ -37,25 +44,28 @@ int ReadConfig(long *port, char directory[10])
     return 0;
 }
 
-int ListenerStartup(void)
+static int ListenerStartup(char directory[10])
 {
     long port;
-    char directory[10];
 
     if (ReadConfig(&port, directory) == -1) {
         return -1;
     }
 
-    /* ask for IPv4 TCP addresses suitable for a listening server. */
+    /* getaddrinfo() takes the port as text. Five digits plus '\0' fit here
+       because ReadConfig() already checked the port range. */
     struct addrinfo hints, *results, *address;
     char port_string[6];
     snprintf(port_string, sizeof port_string, "%ld", port);
 
+    /* Zero every hint first. AF_INET selects IPv4, SOCK_STREAM selects TCP
+       here, and AI_PASSIVE with a NULL host gives a wildcard bind address. */
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
+    /* getaddrinfo() supplies its own error codes and allocates the result list. */
     int status = getaddrinfo(NULL, port_string, &hints, &results);
     if (status != 0) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(status));
@@ -72,6 +82,8 @@ int ListenerStartup(void)
             continue;
         }
 
+        /* SO_REUSEADDR helps the server bind again soon after a restart.
+           The option value is passed by address along with its byte size. */
         if (setsockopt(listening_socket, SOL_SOCKET, SO_REUSEADDR,
                        &reuse_address, sizeof reuse_address) == -1) {
             perror("setsockopt");
@@ -80,6 +92,8 @@ int ListenerStartup(void)
             return -1;
         }
 
+        /* bind() assigns this socket the local address and port. On failure,
+           close this socket before trying the next candidate in the list. */
         if (bind(listening_socket, address->ai_addr, address->ai_addrlen) == -1) {
             perror("bind");
             close(listening_socket);
@@ -98,7 +112,8 @@ int ListenerStartup(void)
 
     printf("Socket bound to port %ld.\n", port);
 
-    /* allow connection requests to wait until the server accepts them. */
+    /* listen() marks this socket as a listener. The second argument is the
+       requested backlog for connections waiting to be accepted. */
     if (listen(listening_socket, 10) == -1) {
         perror("listen");
         close(listening_socket);
@@ -111,11 +126,15 @@ int ListenerStartup(void)
 }
 
 /* wait for one peer and return its connected socket. */
-int WaitForPeer(int listening_socket)
+static int WaitForPeer(int listening_socket)
 {
+    /* accept() writes the remote address into this buffer. Its length starts
+       as the available space and comes back as the size actually written. */
     struct sockaddr_storage peer_address;
     socklen_t peer_address_size = sizeof peer_address;
 
+    /* accept() can block until a peer connects. It returns a separate socket
+       for talking to that peer while listening_socket stays open. */
     int connected_socket = accept(listening_socket,
                                   (struct sockaddr *)&peer_address,
                                   &peer_address_size);
@@ -128,67 +147,56 @@ int WaitForPeer(int listening_socket)
     return connected_socket;
 }
 
-/* handle one accepted connection. */
-void *Worker(void *argument)
+/* Start one worker; it owns the socket after a successful pthread_create. */
+static void StartWorker(int connected_socket, const char *directory)
 {
-    int connected_socket = *(int *)argument;
-    free(argument);
+    /* Allocate one argument block per connection so it outlives this call.
+       sizeof *worker_args gets the size of the struct, rather than the pointer. */
+    WorkerArgs *worker_args = malloc(sizeof *worker_args);
+    if (worker_args == NULL) {
+        perror("malloc");
+        close(connected_socket);
+        return;
+    }
+    worker_args->connected_socket = connected_socket;
+    strcpy(worker_args->directory, directory);
 
-    printf("Worker handling socket %d.\n", connected_socket);
-
-    /* Read and print a short test message from the peer. */
-    char message[1024];
-    ssize_t bytes_received = recv(connected_socket, message, sizeof message - 1, 0);
-    if (bytes_received > 0) {
-        message[bytes_received] = '\0';
-        printf("Received: %s\n", message);
-    } else if (bytes_received == 0) {
-        printf("Peer disconnected without sending a message.\n");
-    } else {
-        perror("recv");
+    /* pthread_create() starts Worker(worker_args). It returns an error code
+       directly, so strerror() uses thread_status here rather than errno. */
+    pthread_t worker_thread;
+    int thread_status = pthread_create(&worker_thread, NULL, Worker,
+                                       worker_args);
+    if (thread_status != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(thread_status));
+        free(worker_args);
+        close(connected_socket);
+        return;
     }
 
-    close(connected_socket);
-    return NULL;
+    /* Detach so the thread's resources are reclaimed when it exits without
+       main needing to wait for it with pthread_join(). */
+    thread_status = pthread_detach(worker_thread);
+    if (thread_status != 0) {
+        fprintf(stderr, "pthread_detach: %s\n", strerror(thread_status));
+    }
 }
 
 int main(void)
 {
-    int listening_socket = ListenerStartup();
+    char directory[10];
+    int listening_socket = ListenerStartup(directory);
     if (listening_socket == -1) {
         return 1; // Startup failure
     }
 
-    /* accept connections one at a time and continue listening. */
+    /* The main thread accepts connections. Each worker handles its own peer,
+       so the main thread can accept another connection while it runs. */
     while (1) {
         int connected_socket = WaitForPeer(listening_socket);
         if (connected_socket == -1) {
             continue;
         }
 
-        /* give worker its own copy of the connected socket number. */
-        int *worker_socket = malloc(sizeof *worker_socket);
-        if (worker_socket == NULL) {
-            perror("malloc");
-            close(connected_socket);
-            continue;
-        }
-        *worker_socket = connected_socket;
-
-        pthread_t worker_thread;
-        int thread_status = pthread_create(&worker_thread, NULL, Worker,
-                                           worker_socket);
-        if (thread_status != 0) {
-            fprintf(stderr, "pthread_create: %s\n", strerror(thread_status));
-            free(worker_socket);
-            close(connected_socket);
-            continue;
-        }
-
-        /* release thread resources automatically when the worker finishes. */
-        thread_status = pthread_detach(worker_thread);
-        if (thread_status != 0) {
-            fprintf(stderr, "pthread_detach: %s\n", strerror(thread_status));
-        }
+        StartWorker(connected_socket, directory);
     }
 }
