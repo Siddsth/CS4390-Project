@@ -1,196 +1,337 @@
-/* Expose POSIX file functions such as getline() and mkstemp(). */
 #define _POSIX_C_SOURCE 200809L
 #include "tracker_files.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #define TRACKER_PATH_SIZE 512
-/* The marker separates file metadata from the list of peer rows. */
-#define PEER_HEADER "#list of peers follows next\n"
 
-/* Every worker uses this mutex. Holding it for the whole read/write operation
-   keeps two workers from overwriting each other's updates. */
-static pthread_mutex_t tracker_lock = PTHREAD_MUTEX_INITIALIZER;
+/* This separator is part of the required .track file format. */
+#define PEER_LIST_MARKER "#list of peers follows next\n"
 
-/* Return a protocol status string that the worker can send or translate. */
-const char *CreateTracker(const char *directory, const CreateRequest *request)
+/* An update must wait until the seed finishes writing the initial .track file. */
+static pthread_mutex_t trackfile_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int ReadTrackerList(const char *torrent_dir, TrackerListing **files, size_t *file_count)
 {
-    char path[TRACKER_PATH_SIZE];
-    int length = snprintf(path, sizeof path, "%s/%s.track",
-                          directory, request->filename);
-    /* snprintf() reports how many characters it needed, excluding '\0'.
-       Reject a path that would not fit in the buffer. */
-    if (length < 0 || (size_t)length >= sizeof path) {
-        return "fail";
+    *files = NULL;
+    *file_count = 0;
+    if (pthread_mutex_lock(&trackfile_lock) != 0) {
+        return -1;
     }
-    if (pthread_mutex_lock(&tracker_lock) != 0) {
+
+    DIR *torrents = opendir(torrent_dir);
+    if (torrents == NULL) {
+        pthread_mutex_unlock(&trackfile_lock);
+        return -1;
+    }
+
+    int list_status = 0;
+    while (1) {
+        errno = 0;
+        struct dirent *entry = readdir(torrents);
+        if (entry == NULL) {
+            if (errno != 0) {
+                list_status = -1;
+            }
+            break;
+        }
+        size_t name_len = strlen(entry->d_name);
+        if (name_len <= 6 || strcmp(entry->d_name + name_len - 6, ".track") != 0) {
+            continue;
+        }
+
+        char track_path[TRACKER_PATH_SIZE];
+        snprintf(track_path, sizeof track_path, "%s/%s", torrent_dir, entry->d_name);
+        struct stat track_info;
+        if (stat(track_path, &track_info) == -1) {
+            list_status = -1;
+            break;
+        }
+        if (!S_ISREG(track_info.st_mode)) {
+            continue;
+        }
+
+        FILE *trackfile = fopen(track_path, "r");
+        if (trackfile == NULL) {
+            list_status = -1;
+            break;
+        }
+        TrackerListing shared_file = {0};
+        char row[512];
+        while (fgets(row, sizeof row, trackfile) != NULL) {
+            sscanf(row, "Filename: %249s", shared_file.filename);
+            sscanf(row, "Filesize: %31s", shared_file.file_size);
+            sscanf(row, "MD5: %32s", shared_file.md5);
+            if (shared_file.filename[0] != '\0' && shared_file.file_size[0] != '\0' &&
+                shared_file.md5[0] != '\0') {
+                break;
+            }
+        }
+        int read_error = ferror(trackfile);
+        int close_status = fclose(trackfile);
+        if (read_error || close_status != 0 || shared_file.filename[0] == '\0' ||
+            shared_file.file_size[0] == '\0' || strlen(shared_file.md5) != 32) {
+            list_status = -1;
+            break;
+        }
+
+        TrackerListing *larger_list = realloc(*files, (*file_count + 1) * sizeof **files);
+        if (larger_list == NULL) {
+            list_status = -1;
+            break;
+        }
+        *files = larger_list;
+        (*files)[*file_count] = shared_file;
+        (*file_count)++;
+    }
+
+    if (closedir(torrents) == -1) {
+        list_status = -1;
+    }
+    pthread_mutex_unlock(&trackfile_lock);
+    if (list_status == -1) {
+        free(*files);
+        *files = NULL;
+        *file_count = 0;
+    }
+    return list_status;
+}
+
+const char *ReadTrackerCopy(const char *torrent_dir, const char *track_name, char **text)
+{
+    *text = NULL;
+    char track_path[TRACKER_PATH_SIZE];
+    int path_len = snprintf(track_path, sizeof track_path, "%s/%s", torrent_dir, track_name);
+    if (path_len < 0 || (size_t)path_len >= sizeof track_path ||
+        pthread_mutex_lock(&trackfile_lock) != 0) {
         return "fail";
     }
 
-    /* The x in "wx" makes creation exclusive. If the file exists, fopen()
-       fails with EEXIST and the worker can report ferr. */
-    FILE *file = fopen(path, "wx");
-    if (file == NULL) {
-        const char *reply = errno == EEXIST ? "ferr" : "fail";
-        pthread_mutex_unlock(&tracker_lock);
+    FILE *trackfile = fopen(track_path, "rb");
+    if (trackfile == NULL) {
+        const char *reply = errno == ENOENT ? "ferr" : "fail";
+        pthread_mutex_unlock(&trackfile_lock);
         return reply;
     }
 
-    /* time(NULL) returns the current timestamp or (time_t)-1 on failure. */
-    time_t timestamp = time(NULL);
-    int written = -1;
-    if (timestamp != (time_t)-1) {
-        /* Adjacent string literals combine into a single format string.
-           The first peer row records IP:port:start:end:timestamp. */
-        written = fprintf(file,
-            "Filename: %s\nFilesize: %s\nDescription: %s\nMD5: %s\n"
-            PEER_HEADER "%s:%s:0:%s:%lld\n",
-            request->filename, request->file_size, request->description,
-            request->md5, request->ip, request->port, request->file_size,
-            (long long)timestamp);
+    long file_bytes = -1;
+    if (fseek(trackfile, 0, SEEK_END) == 0) {
+        file_bytes = ftell(trackfile);
+    }
+    if (file_bytes <= 0 || fseek(trackfile, 0, SEEK_SET) != 0) {
+        fclose(trackfile);
+        pthread_mutex_unlock(&trackfile_lock);
+        return "fail";
     }
 
-    /* fclose() flushes buffered output. If either writing or flushing fails,
-       remove the incomplete file so a later creation can start fresh. */
-    int closed = fclose(file);
+    char *copy = malloc((size_t)file_bytes + 1);
+    if (copy == NULL) {
+        fclose(trackfile);
+        pthread_mutex_unlock(&trackfile_lock);
+        return "fail";
+    }
+    size_t n_read = fread(copy, 1, (size_t)file_bytes, trackfile);
+    int close_status = fclose(trackfile);
+    pthread_mutex_unlock(&trackfile_lock);
+    if (n_read != (size_t)file_bytes || close_status != 0 ||
+        copy[n_read - 1] != '\n' || memchr(copy, '\0', n_read) != NULL) {
+        free(copy);
+        return "fail";
+    }
+    copy[n_read] = '\0';
+    *text = copy;
+    return "succ";
+}
+
+const char *CreateSeedTracker(const char *torrent_dir, const CreateRequest *seed)
+{
+    char track_path[TRACKER_PATH_SIZE];
+    int path_len = snprintf(track_path, sizeof track_path, "%s/%s.track",
+                            torrent_dir, seed->filename);
+
+    if (path_len < 0 || (size_t)path_len >= sizeof track_path) {
+        return "fail";
+    }
+
+    time_t last_seen = time(NULL);
+    if (last_seen == (time_t)-1) {
+        return "fail";
+    }
+
+    if (pthread_mutex_lock(&trackfile_lock) != 0) {
+        return "fail";
+    }
+
+    /* Another seed may advertise the same filename; keep the first tracker. */
+    FILE *trackfile = fopen(track_path, "wx");
+    if (trackfile == NULL) {
+        const char *reply = "fail";
+        if (errno == EEXIST) {
+            reply = "ferr";
+        }
+
+        pthread_mutex_unlock(&trackfile_lock);
+        return reply;
+    }
+
+    /* The seed already holds the whole file, so it supplies the first peer row. */
+    int written = fprintf(trackfile,
+        "Filename: %s\n"
+        "Filesize: %s\n"
+        "Description: %s\n"
+        "MD5: %s\n"
+        PEER_LIST_MARKER
+        "%s:%s:0:%s:%lld\n",
+        seed->filename, seed->file_size, seed->description,
+        seed->md5, seed->ip, seed->port, seed->file_size,
+        (long long)last_seen);
+
+    /* Buffered writes can fail at close; an incomplete tracker must be removed. */
+    int close_status = fclose(trackfile);
     const char *reply = "succ";
-    if (written < 0 || closed != 0) {
-        unlink(path);
+    if (written < 0 || close_status != 0) {
+        unlink(track_path);
         reply = "fail";
     }
-    pthread_mutex_unlock(&tracker_lock);
+
+    pthread_mutex_unlock(&trackfile_lock);
     return reply;
 }
 
-/* Copy the metadata and other peers; replace this peer or append a new entry. */
-static int CopyWithUpdate(FILE *original, FILE *updated,
-                          const UpdateRequest *request, time_t timestamp)
+/* Refresh one peer's range and last-seen time without changing file metadata. */
+static int RewritePeerList(FILE *trackfile, FILE *replacement,
+                          const UpdateRequest *peer_update, time_t last_seen)
 {
-    /* getline() allocates and grows line as needed. Pass its address so
-       getline() can change the pointer, and free the final buffer below. */
-    char *line = NULL;
-    size_t capacity = 0;
-    int in_peers = 0;
-    int found = 0;
-    int error = 0;
+    char *row = NULL;
+    size_t row_capacity = 0;
+    int in_peer_list = 0;
+    int peer_found = 0;
+    int io_error = 0;
 
-    while (getline(&line, &capacity, original) != -1) {
-        if (strcmp(line, PEER_HEADER) == 0) {
-            in_peers = 1;
-        } else if (in_peers) {
-            char saved_ip[16];
-            unsigned int saved_port;
-            /* %15[^:] reads up to 15 characters before a colon. Match both
-               the IP text and the numeric port to identify the peer. */
-            if (sscanf(line, "%15[^:]:%u:", saved_ip, &saved_port) == 2 &&
-                strcmp(saved_ip, request->ip) == 0 &&
-                saved_port == strtoul(request->port, NULL, 10)) {
-                if (!found && fprintf(updated, "%s:%s:%s:%s:%lld\n",
-                        request->ip, request->port, request->start,
-                        request->end, (long long)timestamp) < 0) {
-                    error = 1;
+    while (getline(&row, &row_capacity, trackfile) != -1) {
+        if (strcmp(row, PEER_LIST_MARKER) == 0) {
+            in_peer_list = 1;
+        } else if (in_peer_list) {
+            char listed_ip[16];
+            unsigned int listed_port;
+
+            /* Peers can share an IP, so match the listening port as well. */
+            if (sscanf(row, "%15[^:]:%u:", listed_ip, &listed_port) == 2 &&
+                strcmp(listed_ip, peer_update->ip) == 0 &&
+                listed_port == strtoul(peer_update->port, NULL, 10)) {
+                if (!peer_found && fprintf(replacement, "%s:%s:%s:%s:%lld\n",
+                        peer_update->ip, peer_update->port, peer_update->start,
+                        peer_update->end, (long long)last_seen) < 0) {
+                    io_error = 1;
                 }
-                /* Skip the old row. If the same peer appears again, skip
-                   that duplicate too, since we already wrote its update. */
-                found = 1;
+
+                /* Keep just one row if this peer was listed more than once. */
+                peer_found = 1;
                 continue;
             }
         }
-        if (fputs(line, updated) == EOF) {
-            error = 1;
+        if (fputs(row, replacement) == EOF) {
+            io_error = 1;
         }
     }
 
-    /* A read error or a missing peer-list marker means this copy cannot be used. */
-    if (ferror(original) || !in_peers) {
-        error = 1;
+    if (ferror(trackfile) || !in_peer_list) {
+        io_error = 1;
     }
-    if (!error && !found && fprintf(updated, "%s:%s:%s:%s:%lld\n",
-            request->ip, request->port, request->start, request->end,
-            (long long)timestamp) < 0) {
-        error = 1;
+    if (!io_error && !peer_found && fprintf(replacement, "%s:%s:%s:%s:%lld\n",
+            peer_update->ip, peer_update->port, peer_update->start, peer_update->end,
+            (long long)last_seen) < 0) {
+        io_error = 1;
     }
-    free(line);
-    return error ? -1 : 0;
+    free(row);
+    return io_error ? -1 : 0;
 }
 
-const char *UpdateTracker(const char *directory, const UpdateRequest *request)
+const char *UpdatePeerEntry(const char *torrent_dir, const UpdateRequest *peer_update)
 {
-    char path[TRACKER_PATH_SIZE];
-    char temp_path[TRACKER_PATH_SIZE + 16];
-    int length = snprintf(path, sizeof path, "%s/%s.track",
-                          directory, request->filename);
-    if (length < 0 || (size_t)length >= sizeof path) {
-        return "fail";
-    }
-    /* mkstemp() replaces the trailing Xs with a unique suffix in the same
-       directory as the tracker, ready for rename() after the write. */
-    snprintf(temp_path, sizeof temp_path, "%s.tmpXXXXXX", path);
-    if (pthread_mutex_lock(&tracker_lock) != 0) {
+    char track_path[TRACKER_PATH_SIZE];
+    int path_len = snprintf(track_path, sizeof track_path, "%s/%s.track",
+                            torrent_dir, peer_update->filename);
+    if (path_len < 0 || (size_t)path_len >= sizeof track_path) {
         return "fail";
     }
 
-    /* Default to fail. If the original file is missing, return ferr. */
-    const char *reply = "fail";
-    FILE *original = fopen(path, "r");
-    FILE *updated = NULL;
-    int temp_created = 0;
-    if (original == NULL) {
-        reply = errno == ENOENT ? "ferr" : "fail";
-        goto cleanup;
+    /* Put the replacement beside the tracker so rename can replace it atomically. */
+    char tmp_path[TRACKER_PATH_SIZE + 16];
+    int tmp_path_len = snprintf(tmp_path, sizeof tmp_path,
+                                "%s.tmpXXXXXX", track_path);
+    if (tmp_path_len < 0 ||
+        (size_t)tmp_path_len >= sizeof tmp_path) {
+        return "fail";
     }
 
-    /* Write a separate copy so an unsuccessful update leaves the original intact. */
-    int fd = mkstemp(temp_path);
-    if (fd == -1) {
-        goto cleanup;
-    }
-    temp_created = 1;
-    /* Turn the open descriptor into a stream for fprintf() and fputs().
-       Once fdopen() succeeds, fclose(updated) closes the descriptor too. */
-    updated = fdopen(fd, "w");
-    if (updated == NULL) {
-        close(fd);
-        goto cleanup;
+    time_t last_seen = time(NULL);
+    if (last_seen == (time_t)-1) {
+        return "fail";
     }
 
-    time_t timestamp = time(NULL);
-    if (timestamp == (time_t)-1 ||
-        CopyWithUpdate(original, updated, request, timestamp) == -1) {
-        goto cleanup;
+    if (pthread_mutex_lock(&trackfile_lock) != 0) {
+        return "fail";
     }
 
-    /* Close both streams before publishing the replacement. Set the pointers
-       to NULL so cleanup does not close the same streams twice. */
-    int read_closed = fclose(original);
-    original = NULL;
-    int write_closed = fclose(updated);
-    updated = NULL;
-    if (read_closed == 0 && write_closed == 0 &&
-        rename(temp_path, path) == 0) {
-        temp_created = 0;
-        reply = "succ";
+    FILE *trackfile = fopen(track_path, "r");
+    if (trackfile == NULL) {
+        const char *reply = "fail";
+        if (errno == ENOENT) {
+            reply = "ferr";
+        }
+
+        pthread_mutex_unlock(&trackfile_lock);
+        return reply;
     }
 
-/* Error paths jump here to close any open streams, remove an unused
-   temporary file, and always release the mutex. */
-cleanup:
-    if (original != NULL) {
-        fclose(original);
+    /* Keep the old peer list intact until the replacement is ready. */
+    int tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd == -1) {
+        fclose(trackfile);
+        pthread_mutex_unlock(&trackfile_lock);
+        return "fail";
     }
-    if (updated != NULL) {
-        fclose(updated);
+
+    /* Once fdopen succeeds, fclose(replacement) also closes tmp_fd. */
+    FILE *replacement = fdopen(tmp_fd, "w");
+    if (replacement == NULL) {
+        close(tmp_fd);
+        fclose(trackfile);
+        unlink(tmp_path);
+        pthread_mutex_unlock(&trackfile_lock);
+        return "fail";
     }
-    if (temp_created) {
-        unlink(temp_path);
+
+    int peerlist_status = RewritePeerList(trackfile, replacement, peer_update,
+                                         last_seen);
+
+    /* Publish the peer list only after copying and flushing have succeeded. */
+    int track_closed = fclose(trackfile);
+    int replacement_closed = fclose(replacement);
+    if (peerlist_status != 0 || track_closed != 0 ||
+        replacement_closed != 0) {
+        unlink(tmp_path);
+        pthread_mutex_unlock(&trackfile_lock);
+        return "fail";
     }
-    pthread_mutex_unlock(&tracker_lock);
+
+    int rename_status = rename(tmp_path, track_path);
+    const char *reply = "succ";
+    if (rename_status != 0) {
+        unlink(tmp_path);
+        reply = "fail";
+    }
+
+    pthread_mutex_unlock(&trackfile_lock);
     return reply;
 }
 

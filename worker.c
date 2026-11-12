@@ -1,7 +1,7 @@
-/* Expose POSIX functions such as strtok_r() before including headers. */
 #define _POSIX_C_SOURCE 200809L
 #include "worker.h"
 #include "tracker_files.h"
+#include "file_hash.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -11,268 +11,250 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define REQUEST_SIZE 1024
-#define MAX_FIELDS 7 /* Command name plus up to six arguments. */
+#define TRACKER_CMD_SIZE 1024
+#define TRACKER_CMD_FIELDS 7
 
-/* Send all of the text, even if send() writes only part of it. */
-static int SendText(int socket, const char *text)
+/* Reply text may need several sends; a disconnected peer must not raise SIGPIPE. */
+static int SendPeerReply(int peer_fd, const char *reply_text)
 {
-    size_t remaining = strlen(text);
-    while (remaining > 0) {
-        /* send() returns a signed byte count or -1. MSG_NOSIGNAL lets us
-           handle a disconnected peer as a send error without SIGPIPE. */
-        ssize_t sent = send(socket, text, remaining, MSG_NOSIGNAL);
-        if (sent < 0 && errno == EINTR) {
-            continue; /* Retry after a signal interrupted the call. */
+    size_t bytes_left = strlen(reply_text);
+    while (bytes_left > 0) {
+        ssize_t n_sent = send(peer_fd, reply_text, bytes_left, MSG_NOSIGNAL);
+        if (n_sent < 0 && errno == EINTR) {
+            continue;
         }
-        if (sent <= 0) {
+        if (n_sent <= 0) {
             return -1;
         }
-        /* Move the pointer past the bytes already sent and retry the rest. */
-        text += sent;
-        remaining -= (size_t)sent;
+
+        reply_text += n_sent;
+        bytes_left -= (size_t)n_sent;
     }
     return 0;
 }
 
-/* Read a line from this peer and repeat the question for invalid input. */
-static int ConfirmCreate(int socket)
+static int SplitTrackerCommand(char *cmd, char *parts[TRACKER_CMD_FIELDS])
 {
-    const char *prompt = "Create track file with above information? [Y] Yes [N] No\n";
-    while (1) {
-        if (SendText(socket, prompt) == -1) {
-            return 0;
-        }
-
-        /* Keep the buffer small, but read through the newline even if the
-           answer is too long so the next attempt starts on a fresh line. */
-        char answer[4];
-        size_t length = 0;
-        int too_long = 0;
-        char character;
-        while (1) {
-            ssize_t received = recv(socket, &character, 1, 0);
-            if (received < 0 && errno == EINTR) {
-                continue;
-            }
-            /* Zero means the peer closed its sending side. A negative value
-               here means a receive error other than EINTR. */
-            if (received <= 0) {
-                return 0;
-            }
-            if (character == '\n') {
-                break;
-            }
-            if (length < sizeof answer - 1) {
-                answer[length++] = character;
-            } else {
-                too_long = 1;
-            }
-        }
-        /* Accept a line ending in either LF or CRLF. */
-        if (length > 0 && answer[length - 1] == '\r') {
-            length--;
-        }
-        answer[length] = '\0';
-        if (!too_long && length == 1 && answer[0] == 'Y') {
-            return 1;
-        }
-        if (!too_long && length == 1 && answer[0] == 'N') {
-            return 0;
-        }
+    cmd += strspn(cmd, " \t\r\n");
+    if (cmd[0] == '<') {
+        cmd++;
     }
-}
+    int n_parts = 0;
 
-
-/* Split the command and its fields. An extra field makes the request invalid. */
-static int SplitRequest(char *message, char *fields[MAX_FIELDS])
-{
-    /* Skip leading whitespace and an optional opening angle bracket. */
-    message += strspn(message, " \t\r\n");
-    if (message[0] == '<') {
-        message++;
-    }
-    int count = 0;
-    /* strtok_r() splits message in place. Each field points into message,
-       and next holds the parsing position for this worker's request. */
-    char *next;
-    char *field = strtok_r(message, " \t\r\n>", &next);
-    while (field != NULL) {
-        if (count == MAX_FIELDS) {
+    /* Parser state stays with this peer; other workers tokenize their own commands. */
+    char *parse_pos;
+    char *part = strtok_r(cmd, " \t\r\n>", &parse_pos);
+    while (part != NULL) {
+        if (n_parts == TRACKER_CMD_FIELDS) {
             return -1;
         }
-        fields[count++] = field;
-        /* NULL tells strtok_r() to continue from the saved position. */
-        field = strtok_r(NULL, " \t\r\n>", &next);
+        parts[n_parts++] = part;
+
+        part = strtok_r(NULL, " \t\r\n>", &parse_pos);
     }
-    return count;
+    return n_parts;
 }
 
-static int ValidFilename(const char *filename)
+/* Peers advertise a filename, not a path outside the tracker directory. */
+static int ValidSharedName(const char *shared_name)
 {
-    /* Require a single filename. The length cap leaves six characters for
-       .track within a 255-character filename limit. */
-    return strlen(filename) <= 249 && strchr(filename, '/') == NULL &&
-           strcmp(filename, ".") != 0 && strcmp(filename, "..") != 0;
+    return strlen(shared_name) <= 249 && strchr(shared_name, '/') == NULL &&
+           strcmp(shared_name, ".") != 0 && strcmp(shared_name, "..") != 0;
 }
 
-/* Accept unsigned decimal numbers and reject values too large to represent. */
-static int ReadNumber(const char *text, unsigned long long *value)
+/* Used for file sizes, byte offsets, and advertised ports: no signs or suffixes. */
+static int ParseUnsigned(const char *token, unsigned long long *number)
 {
-    if (text[0] == '\0' || strlen(text) > 31 ||
-        strspn(text, "0123456789") != strlen(text)) {
+    if (token[0] == '\0' || strlen(token) > 31 ||
+        strspn(token, "0123456789") != strlen(token)) {
         return 0;
     }
-    /* Store strtoull()'s base-10 result through value. Reset errno so an
-       earlier call's error cannot be mistaken for overflow here. */
+
     errno = 0;
-    *value = strtoull(text, NULL, 10);
+    *number = strtoull(token, NULL, 10);
     return errno != ERANGE;
 }
 
-static int ValidPeer(const char *ip, const char *port)
+/* This is the advertised serving endpoint, not the tracker connection's source port. */
+static int ValidPeerEndpoint(const char *peer_ip, const char *peer_port)
 {
-    /* inet_pton() checks the IPv4 text. && evaluates left to right, so the
-       port range is checked only after ReadNumber() has filled number. */
-    struct in_addr address;
-    unsigned long long number;
-    return inet_pton(AF_INET, ip, &address) == 1 &&
-           strlen(port) <= 5 && ReadNumber(port, &number) &&
-           number >= 1 && number <= 65535;
+    struct in_addr ipv4;
+    unsigned long long port_number;
+    return inet_pton(AF_INET, peer_ip, &ipv4) == 1 &&
+           strlen(peer_port) <= 5 && ParseUnsigned(peer_port, &port_number) &&
+           port_number >= 1 && port_number <= 65535;
 }
 
-static const char *HandleCreate(int socket, const char *directory,
-                                char *fields[], int count)
+static const char *HandleSeedCreate(const char *torrent_dir,
+                                    char *parts[], int n_parts)
 {
-    if (count != 7) {
+    if (n_parts != 7) {
         return "fail";
     }
-    /* Designated initializers name the struct members. fields[0] holds
-       the command, so the actual request arguments start at fields[1]. */
-    CreateRequest request = {
-        .filename = fields[1],
-        .file_size = fields[2],
-        .description = fields[3],
-        .md5 = fields[4],
-        .ip = fields[5],
-        .port = fields[6]
+
+    CreateRequest seed = {
+        .filename = parts[1],
+        .file_size = parts[2],
+        .description = parts[3],
+        .md5 = parts[4],
+        .ip = parts[5],
+        .port = parts[6]
     };
-    /* Check the size as a number and the MD5 as 32 hexadecimal characters.
-       The request keeps the original text for writing to the tracker file. */
-    unsigned long long size;
-    if (!ValidFilename(request.filename) ||
-        !ReadNumber(request.file_size, &size) ||
-        strlen(request.description) > 255 ||
-        strlen(request.md5) != 32 ||
-        strspn(request.md5, "0123456789abcdefABCDEF") != 32 ||
-        !ValidPeer(request.ip, request.port)) {
+
+    /* The tracker checks MD5 text only; file data never passes through it. */
+    unsigned long long seed_bytes;
+    if (!ValidSharedName(seed.filename) ||
+        !ParseUnsigned(seed.file_size, &seed_bytes) ||
+        strlen(seed.description) > 255 ||
+        strlen(seed.md5) != 32 ||
+        strspn(seed.md5, "0123456789abcdefABCDEF") != 32 ||
+        !ValidPeerEndpoint(seed.ip, seed.port)) {
         return "fail";
     }
 
-    char details[REQUEST_SIZE];
-    int length = snprintf(details, sizeof details,
-        "Filename: %s\nFile size: %s bytes\nDescription: %s\n"
-        "MD5: %s\nPeer IP: %s\nPeer port: %s\nSeed range: 0 to %s\n",
-        request.filename, request.file_size, request.description,
-        request.md5, request.ip, request.port, request.file_size);
-    /* snprintf() reports the length it wanted to write, excluding '\0'.
-       A result at least as large as the buffer means the text was cut off. */
-    if (length < 0 || (size_t)length >= sizeof details) {
-        return "fail";
-    }
-    printf("%s", details);
-
-    /* The file operation starts only after the peer sees the details and
-       confirms. If sending fails, || skips the confirmation call. */
-    if (SendText(socket, details) == -1 || !ConfirmCreate(socket)) {
-        printf("Tracker creation cancelled.\n");
-        return NULL;
-    }
-
-    /* Keep the short status in the server log and send a readable message
-       to the peer for success and duplicate-file errors. */
-    const char *result = CreateTracker(directory, &request);
-    if (strcmp(result, "succ") == 0) {
-        snprintf(details, sizeof details, "Tracker for %s created\n", request.filename);
-    } else if (strcmp(result, "ferr") == 0) {
-        snprintf(details, sizeof details, "File Error: %s tracker already exists\n",
-                 request.filename);
-    } else {
-        return result;
-    }
-
-    printf("Tracker response: %s\n", result);
-    if (SendText(socket, details) == -1) {
-        fprintf(stderr, "Could not send tracker response.\n");
-    }
-    return NULL; /* The peer response was handled here. */
+    return CreateSeedTracker(torrent_dir, &seed);
 }
 
-static const char *HandleUpdate(const char *directory, char *fields[], int count)
+static const char *HandlePeerUpdate(const char *torrent_dir,
+                                    char *parts[], int n_parts)
 {
-    if (count != 6) {
+    if (n_parts != 6) {
         return "fail";
     }
-    UpdateRequest request = {
-        .filename = fields[1],
-        .start = fields[2],
-        .end = fields[3],
-        .ip = fields[4],
-        .port = fields[5]
+    UpdateRequest peer_update = {
+        .filename = parts[1],
+        .start = parts[2],
+        .end = parts[3],
+        .ip = parts[4],
+        .port = parts[5]
     };
-    /* Convert both offsets before comparing them numerically. */
+
     unsigned long long start, end;
-    if (!ValidFilename(request.filename) ||
-        !ReadNumber(request.start, &start) || !ReadNumber(request.end, &end) ||
-        start > end || !ValidPeer(request.ip, request.port)) {
+    if (!ValidSharedName(peer_update.filename) ||
+        !ParseUnsigned(peer_update.start, &start) ||
+        !ParseUnsigned(peer_update.end, &end) ||
+        start > end || !ValidPeerEndpoint(peer_update.ip, peer_update.port)) {
         return "fail";
     }
-    return UpdateTracker(directory, &request);
+    return UpdatePeerEntry(torrent_dir, &peer_update);
 }
 
-/* One worker receives one request, handles it, and closes the connection. */
-void *Worker(void *argument)
+static const char *HandleFileList(int peer_fd, const char *torrent_dir,
+                                  char *parts[], int n_parts)
 {
-    /* pthread_create() passes a void pointer. Cast it back to WorkerArgs *,
-       then dereference it to copy the struct before freeing the original. */
-    WorkerArgs args = *(WorkerArgs *)argument;
-    free(argument);
-    int socket = args.connected_socket;
-    printf("Worker handling socket %d. Tracker directory: %s\n",
-           socket, args.directory);
+    if (n_parts != 2 || strcmp(parts[1], "LIST") != 0) {
+        return "fail";
+    }
 
-    char message[REQUEST_SIZE];
-    /* Reserve one byte for '\0'. This initial read handles one buffer of
-       bytes. TCP can split a request across multiple reads. */
-    ssize_t received = recv(socket, message, sizeof message - 1, 0);
-    if (received <= 0) {
-        if (received < 0) {
+    TrackerListing *files;
+    size_t file_count;
+    if (ReadTrackerList(torrent_dir, &files, &file_count) == -1) {
+        return "fail";
+    }
+
+    /* The count and rows use the same copy of the tracker metadata. */
+    char list_line[TRACKER_CMD_SIZE];
+    snprintf(list_line, sizeof list_line, "<REP LIST %zu>\n", file_count);
+    int send_status = SendPeerReply(peer_fd, list_line);
+    for (size_t i = 0; i < file_count && send_status == 0; i++) {
+        snprintf(list_line, sizeof list_line, "<%zu %s %s %s>\n",
+                 i + 1, files[i].filename, files[i].file_size, files[i].md5);
+        send_status = SendPeerReply(peer_fd, list_line);
+    }
+    if (send_status == 0) {
+        send_status = SendPeerReply(peer_fd, "<REP LIST END>\n");
+    }
+    free(files);
+    if (send_status == -1) {
+        fprintf(stderr, "Could not send tracker list.\n");
+    }
+    return NULL;
+}
+
+static const char *HandleTrackerGet(int peer_fd, const char *torrent_dir,
+                                    char *parts[], int n_parts)
+{
+    if (n_parts != 2) {
+        return "fail";
+    }
+    size_t name_len = strlen(parts[1]);
+    if (name_len <= 6 || name_len > 255 ||
+        strcmp(parts[1] + name_len - 6, ".track") != 0) {
+        return "fail";
+    }
+    char shared_name[250];
+    memcpy(shared_name, parts[1], name_len - 6);
+    shared_name[name_len - 6] = '\0';
+    if (!ValidSharedName(shared_name)) {
+        return "fail";
+    }
+
+    char *tracker_text;
+    const char *read_reply = ReadTrackerCopy(torrent_dir, parts[1], &tracker_text);
+    if (strcmp(read_reply, "succ") != 0) {
+        return read_reply;
+    }
+    char md5[33];
+    if (GetMD5(tracker_text, strlen(tracker_text), md5) == -1) {
+        free(tracker_text);
+        return "fail";
+    }
+
+    char end_line[64];
+    snprintf(end_line, sizeof end_line, "<REP GET END %s>\n", md5);
+    if (SendPeerReply(peer_fd, "<REP GET BEGIN>\n") == -1 ||
+        SendPeerReply(peer_fd, tracker_text) == -1 ||
+        SendPeerReply(peer_fd, end_line) == -1) {
+        fprintf(stderr, "Could not send tracker file.\n");
+    }
+    free(tracker_text);
+    return NULL;
+}
+
+void *ServeTrackerPeer(void *session_ptr)
+{
+    /* Take the listener's session copy and release its heap allocation. */
+    PeerSession peer = *(PeerSession *)session_ptr;
+    free(session_ptr);
+    int peer_fd = peer.peer_fd;
+    printf("Worker handling socket %d. Tracker directory: %s\n",
+           peer_fd, peer.torrent_dir);
+
+    char cmd_buf[TRACKER_CMD_SIZE];
+
+    /* TODO: assemble a complete command here; TCP can split a request. */
+    ssize_t n_read = recv(peer_fd, cmd_buf, sizeof cmd_buf - 1, 0);
+    if (n_read <= 0) {
+        if (n_read < 0) {
             perror("recv");
-            SendText(socket, "fail");
+            SendPeerReply(peer_fd, "fail");
         }
-        close(socket);
+        close(peer_fd);
         return NULL;
     }
-    message[received] = '\0';
-    printf("Received: %s\n", message);
+    cmd_buf[n_read] = '\0';
+    printf("Received: %s\n", cmd_buf);
 
-    char *fields[MAX_FIELDS];
-    int count = SplitRequest(message, fields);
-    const char *reply = "fail";
-    if (count > 0 && strcmp(fields[0], "createtracker") == 0) {
-        reply = HandleCreate(socket, args.directory, fields, count);
-    } else if (count > 0 && strcmp(fields[0], "updatetracker") == 0) {
-        reply = HandleUpdate(args.directory, fields, count);
+    char *parts[TRACKER_CMD_FIELDS];
+    int n_parts = SplitTrackerCommand(cmd_buf, parts);
+    const char *tracker_reply = "fail";
+    if (n_parts > 0 && strcmp(parts[0], "createtracker") == 0) {
+        tracker_reply = HandleSeedCreate(peer.torrent_dir, parts, n_parts);
+    } else if (n_parts > 0 && strcmp(parts[0], "updatetracker") == 0) {
+        tracker_reply = HandlePeerUpdate(peer.torrent_dir, parts, n_parts);
+    } else if (n_parts > 0 && strcmp(parts[0], "REQ") == 0) {
+        tracker_reply = HandleFileList(peer_fd, peer.torrent_dir, parts, n_parts);
+    } else if (n_parts > 0 && strcmp(parts[0], "GET") == 0) {
+        tracker_reply = HandleTrackerGet(peer_fd, peer.torrent_dir, parts, n_parts);
     }
 
-    /* Create handles some responses itself. A NULL reply tells the worker
-       it can close the connection without sending any more text. */
-    if (reply != NULL) {
-        printf("Tracker response: %s\n", reply);
-        if (SendText(socket, reply) == -1) {
+    /* LIST and GET send their own multiline replies. */
+    if (tracker_reply != NULL) {
+        printf("Tracker response: %s\n", tracker_reply);
+        if (SendPeerReply(peer_fd, tracker_reply) == -1) {
             fprintf(stderr, "Could not send tracker response.\n");
         }
     }
-    close(socket);
+    close(peer_fd);
     return NULL;
 }

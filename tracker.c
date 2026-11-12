@@ -1,4 +1,3 @@
-/* Expose POSIX declarations such as getaddrinfo() before including headers. */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,194 +8,168 @@
 #include <unistd.h>
 #include "worker.h"
 
-/* port and directory are outputs. The caller supplies room for 10 characters. */
-static int ReadConfig(long *port, char directory[10])
+static int LoadTrackerSettings(long *tracker_port, char torrent_dir[10])
 {
-    /* read sconfig */ 
-    FILE *config = fopen("sconfig", "r");
-    if (config == NULL) {
+    FILE *sconfig = fopen("sconfig", "r");
+    if (sconfig == NULL) {
         perror("sconfig");
         return -1;
     }
 
-    char extra;
+    char trailing;
 
-    /* %ld fills the caller's long. %9s leaves one byte for the string's '\0'.
-       The space before %c skips whitespace, so a third assignment means
-       there was extra content after the two expected fields. */
-    int fields = fscanf(config, "%ld %9s %c", port, directory, &extra);
-    fclose(config);
+    /* The directory must also fit in PeerSession.torrent_dir. */
+    int fields_read = fscanf(sconfig, "%ld %9s %c", tracker_port,
+                             torrent_dir, &trailing);
+    fclose(sconfig);
 
-    if (fields != 2) {
+    if (fields_read != 2) {
         fprintf(stderr, "sconfig needs a port number and a directory name.\n");
         return -1;
     }
 
-    /* *port reads the value that fscanf() wrote through the pointer. */
-    if (*port < 1 || *port > 65535) {
+    if (*tracker_port < 1 || *tracker_port > 65535) {
         fprintf(stderr, "The port must be a number from 1 to 65535.\n");
         return -1;
     }
 
-    /* print port number and directory path*/
-    printf("Tracker port: %ld\n", *port);
-    printf("Tracker directory: %s\n", directory);
+    printf("Tracker port: %ld\n", *tracker_port);
+    printf("Tracker directory: %s\n", torrent_dir);
     return 0;
 }
 
-static int ListenerStartup(char directory[10])
+static int OpenTrackerListener(char torrent_dir[10])
 {
-    long port;
+    long tracker_port;
 
-    if (ReadConfig(&port, directory) == -1) {
+    if (LoadTrackerSettings(&tracker_port, torrent_dir) == -1) {
         return -1;
     }
 
-    /* getaddrinfo() takes the port as text. Five digits plus '\0' fit here
-       because ReadConfig() already checked the port range. */
-    struct addrinfo hints, *results, *address;
-    char port_string[6];
-    snprintf(port_string, sizeof port_string, "%ld", port);
+    struct addrinfo hints, *bind_addrs, *candidate;
+    char port_text[6];
+    snprintf(port_text, sizeof port_text, "%ld", tracker_port);
 
-    /* Zero every hint first. AF_INET selects IPv4, SOCK_STREAM selects TCP
-       here, and AI_PASSIVE with a NULL host gives a wildcard bind address. */
+    /* Peers may run on other machines, so bind all local IPv4 interfaces. */
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    /* getaddrinfo() supplies its own error codes and allocates the result list. */
-    int status = getaddrinfo(NULL, port_string, &hints, &results);
-    if (status != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(status));
+    int lookup_error = getaddrinfo(NULL, port_text, &hints, &bind_addrs);
+    if (lookup_error != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(lookup_error));
         return -1;
     }
 
-    /* try each returned address until a socket can be created and bound. */
-    int listening_socket = -1;
-    int reuse_address = 1;
-    for (address = results; address != NULL; address = address->ai_next) {
-        listening_socket = socket(address->ai_family, address->ai_socktype,
-                                  address->ai_protocol);
-        if (listening_socket == -1) {
+    int listen_fd = -1;
+    int reuse_addr = 1;
+    for (candidate = bind_addrs; candidate != NULL; candidate = candidate->ai_next) {
+        listen_fd = socket(candidate->ai_family, candidate->ai_socktype,
+                           candidate->ai_protocol);
+        if (listen_fd == -1) {
             continue;
         }
 
-        /* SO_REUSEADDR helps the server bind again soon after a restart.
-           The option value is passed by address along with its byte size. */
-        if (setsockopt(listening_socket, SOL_SOCKET, SO_REUSEADDR,
-                       &reuse_address, sizeof reuse_address) == -1) {
+        /* Allow tracker restarts between tests while old connections age out. */
+        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR,
+                       &reuse_addr, sizeof reuse_addr) == -1) {
             perror("setsockopt");
-            close(listening_socket);
-            freeaddrinfo(results);
+            close(listen_fd);
+            freeaddrinfo(bind_addrs);
             return -1;
         }
 
-        /* bind() assigns this socket the local address and port. On failure,
-           close this socket before trying the next candidate in the list. */
-        if (bind(listening_socket, address->ai_addr, address->ai_addrlen) == -1) {
+        if (bind(listen_fd, candidate->ai_addr, candidate->ai_addrlen) == -1) {
             perror("bind");
-            close(listening_socket);
-            listening_socket = -1;
+            close(listen_fd);
+            listen_fd = -1;
             continue;
         }
 
         break;
     }
-    freeaddrinfo(results);
+    freeaddrinfo(bind_addrs);
 
-    if (listening_socket == -1) {
+    if (listen_fd == -1) {
         fprintf(stderr, "Could not create and bind a listening socket.\n");
         return -1;
     }
 
-    printf("Socket bound to port %ld.\n", port);
+    printf("Socket bound to port %ld.\n", tracker_port);
 
-    /* listen() marks this socket as a listener. The second argument is the
-       requested backlog for connections waiting to be accepted. */
-    if (listen(listening_socket, 10) == -1) {
+    /* This backlog covers waiting connections, not the number of active peers. */
+    if (listen(listen_fd, 10) == -1) {
         perror("listen");
-        close(listening_socket);
+        close(listen_fd);
         return -1;
     }
 
-    printf("Listening on port %ld. Ctrl+C to quit. \n", port);
+    printf("Listening on port %ld. Ctrl+C to quit. \n", tracker_port);
 
-    return listening_socket;
+    return listen_fd;
 }
 
-/* wait for one peer and return its connected socket. */
-static int WaitForPeer(int listening_socket)
+static int AcceptPeer(int listen_fd)
 {
-    /* accept() writes the remote address into this buffer. Its length starts
-       as the available space and comes back as the size actually written. */
-    struct sockaddr_storage peer_address;
-    socklen_t peer_address_size = sizeof peer_address;
+    struct sockaddr_storage peer_addr;
+    socklen_t addr_len = sizeof peer_addr;
 
-    /* accept() can block until a peer connects. It returns a separate socket
-       for talking to that peer while listening_socket stays open. */
-    int connected_socket = accept(listening_socket,
-                                  (struct sockaddr *)&peer_address,
-                                  &peer_address_size);
-    if (connected_socket == -1) {
+    /* The worker gets this connection; the main thread keeps the listener. */
+    int peer_fd = accept(listen_fd, (struct sockaddr *)&peer_addr, &addr_len);
+    if (peer_fd == -1) {
         perror("accept");
         return -1;
     }
 
     printf("Peer connected.\n");
-    return connected_socket;
+    return peer_fd;
 }
 
-/* Start one worker; it owns the socket after a successful pthread_create. */
-static void StartWorker(int connected_socket, const char *directory)
+static void StartPeerWorker(int peer_fd, const char *torrent_dir)
 {
-    /* Allocate one argument block per connection so it outlives this call.
-       sizeof *worker_args gets the size of the struct, rather than the pointer. */
-    WorkerArgs *worker_args = malloc(sizeof *worker_args);
-    if (worker_args == NULL) {
+    /* Each peer needs its own session; its worker may start after this returns. */
+    PeerSession *session = malloc(sizeof *session);
+    if (session == NULL) {
         perror("malloc");
-        close(connected_socket);
+        close(peer_fd);
         return;
     }
-    worker_args->connected_socket = connected_socket;
-    strcpy(worker_args->directory, directory);
+    session->peer_fd = peer_fd;
+    strcpy(session->torrent_dir, torrent_dir);
 
-    /* pthread_create() starts Worker(worker_args). It returns an error code
-       directly, so strerror() uses thread_status here rather than errno. */
-    pthread_t worker_thread;
-    int thread_status = pthread_create(&worker_thread, NULL, Worker,
-                                       worker_args);
-    if (thread_status != 0) {
-        fprintf(stderr, "pthread_create: %s\n", strerror(thread_status));
-        free(worker_args);
-        close(connected_socket);
+    pthread_t peer_thread;
+    /* A successful start transfers session and peer_fd to ServeTrackerPeer. */
+    int thread_error = pthread_create(&peer_thread, NULL, ServeTrackerPeer,
+                                      session);
+    if (thread_error != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(thread_error));
+        free(session);
+        close(peer_fd);
         return;
     }
 
-    /* Detach so the thread's resources are reclaimed when it exits without
-       main needing to wait for it with pthread_join(). */
-    thread_status = pthread_detach(worker_thread);
-    if (thread_status != 0) {
-        fprintf(stderr, "pthread_detach: %s\n", strerror(thread_status));
+    /* Each peer handles one command; the accept loop never joins its worker. */
+    thread_error = pthread_detach(peer_thread);
+    if (thread_error != 0) {
+        fprintf(stderr, "pthread_detach: %s\n", strerror(thread_error));
     }
 }
 
 int main(void)
 {
-    char directory[10];
-    int listening_socket = ListenerStartup(directory);
-    if (listening_socket == -1) {
-        return 1; // Startup failure
+    char torrent_dir[10];
+    int listen_fd = OpenTrackerListener(torrent_dir);
+    if (listen_fd == -1) {
+        return 1;
     }
 
-    /* The main thread accepts connections. Each worker handles its own peer,
-       so the main thread can accept another connection while it runs. */
     while (1) {
-        int connected_socket = WaitForPeer(listening_socket);
-        if (connected_socket == -1) {
+        int peer_fd = AcceptPeer(listen_fd);
+        if (peer_fd == -1) {
             continue;
         }
 
-        StartWorker(connected_socket, directory);
+        StartPeerWorker(peer_fd, torrent_dir);
     }
 }

@@ -1,11 +1,12 @@
 #ifndef WORKER_H
 #define WORKER_H
 
+/* One accepted tracker connection; its worker takes ownership of this session. */
 typedef struct {
-    int connected_socket;
-    char directory[10];
-} WorkerArgs;
+    int peer_fd;
+    char torrent_dir[10];
+} PeerSession;
 
-void *Worker(void *argument);
+void *ServeTrackerPeer(void *session_ptr);
 
 #endif
