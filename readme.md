@@ -1,102 +1,80 @@
-# CS4390 Project Test: Run Tracker and Peer Locally
+# ServerStartup
 
-This walkthrough runs both programs on one computer. The tracker runs in Terminal 1. The peer runs in Terminal 2 and sends requests to tracker.
+Run these shell commands in Ubuntu/Linux from the `ServerStartup` folder. Use separate terminals for the server, Peer 01, and Peer 02.
 
-## 1. Download the project
+Requires GCC and OpenSSL development files (`build-essential` and `libssl-dev` on Ubuntu).
 
-## 2. Set up Ubuntu and GCC
+## Compile & Start Server
 
-On Windows, use **Ubuntu through WSL** for build and run commands. If Ubuntu is already installed, open it and skip  installation command below.
+```bash
+mkdir -p torrents
+gcc -pthread -o tracker tracker.c worker.c tracker_files.c file_hash.c -lcrypto && ./tracker
+```
 
-For WSL, open **PowerShell as Administrator** and run:
+## Compile Peer (once, before starting either peer)
 
+```bash
+gcc -pthread -o peer peer.c peer_download.c peer_upload.c file_hash.c -lcrypto
+```
 
-`wsl --install -d Ubuntu`
+## Peer 01
 
+From `ServerStartup` in its own terminal:
 
-Restart Windows if prompted. Open **Ubuntu** from the Start menu and finish first-time setup. 
+```bash
+cd peer01_config && ../peer
+```
 
-In **Ubuntu**, install compiler:
+Uses port `6001` and shared folder `Peer01`.
 
+## Peer 02
 
-`sudo apt update`
+From `ServerStartup` in its own terminal:
 
-`sudo apt install -y build-essential`
+```bash
+cd Peer02_Config && ../peer
+```
 
-`gcc --version`
+Uses port `6002` and shared folder `Peer02`.
 
+## Tracker Commands
 
-If you're already on Linux with GCC installed, use regular terminal.
+Enter these at the peer's `Enter a tracker request` prompt. Replace the placeholders with actual values. Commands are case-sensitive; use underscores instead of spaces in descriptions.
 
-## 3. Open the project folder in Ubuntu
+### Create Tracker
 
-Replace path in quotes with path for project clone:
+Register a shared file and its seed's listening address.
 
-`cd "$(wslpath 'C:\Users\YourName\Documents\GitHub\CS4390-Project')`
+```text
+<createtracker filename filesize description md5 peer_ip peer_port>
+```
 
-On native Linux, use `cd` with path where you cloned repository.
+`filesize` is in bytes. `md5` is the file's 32-character hexadecimal checksum. `peer_ip` and `peer_port` identify the peer serving the file (`6001` for Peer 01 or `6002` for Peer 02).
 
-## 4. Terminal 1 — Build and start tracker
+### Update Tracker
 
-Run this command from project folder:
+Add or update a peer's available byte range.
 
-`gcc -pthread -o tracker tracker.c worker.c tracker_files.c && ./tracker`
+```text
+<updatetracker filename byte_start byte_end peer_ip peer_port>
+```
 
-You should see `Listening on port 5000`. Leave this terminal running.
+`byte_start` and `byte_end` are nonnegative byte offsets, with `byte_start <= byte_end`.
 
-## 5. Terminal 2 — Build and start the peer
+### Request File List
 
-Open a **second Ubuntu terminal** and run same `cd` command from step 3. Then run:
+List the files registered with the tracker.
 
-`gcc -o peer peer.c && ./peer`
+```text
+<REQ LIST>
+```
 
-The peer should show `Tracker: 127.0.0.1:5000` and `Enter a tracker request:`. Repository's config files are already set up for this local test.
+### Get Tracker
 
-## 6. Test `createtracker`
+Request a `.track` file. The peer verifies it, then automatically downloads the shared file from a listed complete seed into its shared folder.
 
-At the peer's `Enter a tracker request:` prompt, paste this entire line and press Enter:
+```text
+<GET filename.track>
+```
 
-`<createtracker hello.txt 5 Demo_file 5d41402abc4b2a76b9719d911017c592 127.0.0.1 6001>`
-
-The values describe the included `Peer01/hello.txt` sample. When the tracker asks for confirmation, type uppercase `Y` and press Enter. Expect:
-
-`Tracker for hello.txt created`
-
-Peer disconnects after success/failure.
-
-If you repeat the create test with the same filename, expect `File Error: hello.txt tracker already exists`. You can still use the existing tracker for the update test.
-
-## 7. Test `updatetracker`
-
-In Terminal 2, start the peer again. Each run handles one request.
-
-
-`./peer`
-
-At peer prompt, paste this line and press Enter:
-
-
-`<updatetracker hello.txt 1 4 127.0.0.1 6001>`
-
-Expect `succ`. Can inspect tracker file.
-
-`cat torrents/hello.txt.track`
-
-The peer row for `127.0.0.1` on port `6001` should now show the range `1` to `4`.
-
-To test adding another peer entry, run `./peer` again and paste:
-
-
-`<updatetracker hello.txt 0 3 127.0.0.1 6002>`
-
-Expect `succ`. Running `cat torrents/hello.txt.track` again should show both port `6001` and port `6002`.
-
-## 8. Stop the tracker or troubleshoot
-
-- **Stop the tracker:** Press `Ctrl+C` in Terminal 1.
-- **`peer.c: No such file or directory`:** Run `pwd` and `ls`. Change into the cloned `CS4390-Project` folder and retry.
-- **Config file missing:** Start the executable from the folder containing the config files. 
-- **`connect: Connection refused`:** Check that Terminal 1 is still running `./tracker` and listening on port `5000`.
-- **`Address already in use`:** Check whether you already have a tracker running in another terminal. Use that instance or stop it before starting a new one.
-- **Bash syntax error after pasting `<createtracker ...>`:** Run `./peer` first and paste the request at `Enter a tracker request:`.
-- **`ferr` on `updatetracker`:** Check that `torrents/hello.txt.track` exists and that the filename in the request is `hello.txt`.
+Type `quit` at the peer prompt to stop a peer. Press `Ctrl+C` in the server terminal to stop the tracker.
